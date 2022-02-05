@@ -2,6 +2,6 @@
 
 - Message Passing Neural Network
   - with bond-biased atoms and atom-atom attentions
-  - with global states, local convolutions and node MLPs
-  - with residual blocks inspired by CNNs and Transformers
+  - with global states, neighborhood convolutions and node MLPs
+  - with residual blocks inspired by state-of-the-art CNNs and Transformers
   - with teacher-student (i.e., unmasked-masked) data augmentations
