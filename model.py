@@ -137,8 +137,7 @@ class GNN(nn.Module):
             self.dense = [None] * self.depth
         self.post = nn.Sequential(nn.Linear(self.width, self.width), nn.LayerNorm(self.width, elementwise_affine=False))
 
-        self.head0 = nn.Linear(self.width, 1)
-        self.head1 = nn.Linear(self.width, np.sum(node_size))
+        self.head = nn.Linear(self.width, 1)
         print('#params:', np.sum([np.prod(p.shape) for p in self.parameters()]))
 
     def forward(self, graph, mask=None):
@@ -153,11 +152,7 @@ class GNN(nn.Module):
             if dense is not None: xx, xres = dense(xx)
             if i >= self.depth//2: xlst.append(nn.functional.layer_norm(xres, [self.width])[:, :, None])
         # novel global node = pool(norm(linear(all nodes)))
-        xnode = self.post(xx)
-        xglob = gnn.global_add_pool(xnode, graph.batch)
+        xglob = gnn.global_add_pool(self.post(xx), graph.batch)
 
-        x0 = self.head0(xglob)
-        x1 = self.head1(xnode)
-        x2 = pt.mean(pt.concat(xlst, dim=-1), dim=-1)
-        return x0, x1, x2
+        return self.head(xglob), pt.mean(pt.concat(xlst, dim=-1), dim=-1)
 
