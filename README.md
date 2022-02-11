@@ -1,4 +1,4 @@
-# mol2vec: GNN Embedding from molecules to vectors
+# mol2vec: GNN Embedding from Molecules to Vectors
 
 - Message Passing Neural Network
   - with bond-shifted atom features and unnormalized atom-atom attentions
