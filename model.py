@@ -21,6 +21,10 @@ node_size = (120, 4, 12, 12, 10, 6, 6, 2, 2)
 #1 bond_stereo: class6 *
 #2 is_conjugated: bool
 edge_size = (5, 6, 2)
+#0 global
+#1 aromatic
+#2 ring
+void_size = (3)
 
 
 class EmbedBlock(nn.Module):
@@ -29,23 +33,25 @@ class EmbedBlock(nn.Module):
         self.size = size
         self.width = width
 
+        self.zero = nn.parameter.Parameter(pt.zeros(len(self.size) - 1))
+
         self.embed0 = nn.Embedding(self.size[0]+1, self.width)
         self.embed1 = nn.ModuleList([nn.Embedding(s+1, self.width, padding_idx=0) for s in self.size[1:]])
-        self.zero = nn.parameter.Parameter(pt.zeros(len(self.size) - 1))
 
     def forward(self, x, x0=None):
         x0 = self.embed0(x[:, 0])
         x1 = pt.concat([e(x[:, i+1])[:, :, None] for i, e in enumerate(self.embed1)], dim=-1)
         xx = x0 + pt.sum(x1 * pt.exp(self.zero), dim=-1)
         if x0 is None: return xx
-        else: return (x0 + xx) / 2
+        else: return (xx + x0) / 2  # exponential moving average
 
 
 class GlobBlock(nn.Module):
-    def __init__(self, width, scale):
+    def __init__(self, width, scale, res=1.0):
         super().__init__()
         self.width = width
         self.scale = scale
+        self.res = res
 
         self.zero = nn.parameter.Parameter(pt.tensor([0.0]))
 
@@ -59,49 +65,50 @@ class GlobBlock(nn.Module):
         xx = self.pre(x)
         xx = self.mem(xx) + (self.msg(gnn.global_add_pool(xx, batch)))[batch] * pt.exp(self.zero)
         xx = self.post(xx)
-        return x + xx, xx
+        return x + xx * self.res, xx
 
 class ConvBlock(gnn.MessagePassing):
-    def __init__(self, width, scale, use_edge=False, use_atten=False):
-        super().__init__(aggr="add", flow="source_to_target", node_dim=0)
+    def __init__(self, width, scale, res=1.0, use_edge=False, use_atten=False):
+        super().__init__(aggr="add", flow="source_to_target")
         self.width = width
         self.scale = scale
+        self.res = res
         self.use_edge = use_edge
         self.use_atten = use_atten
 
-        self.embed = EmbedBlock(edge_size, width)
+        self.embed = EmbedBlock(edge_size, self.width*self.scale)
         self.zero = nn.parameter.Parameter(pt.tensor([0.0]))
 
         self.pre = nn.Sequential(nn.Linear(self.width, self.width), nn.LayerNorm(self.width, elementwise_affine=False))
-        self.mem = nn.Sequential(nn.Linear(self.width, self.width*self.scale), nn.GELU())
-        self.msg = nn.Sequential(nn.Linear(self.width, self.width*self.scale), nn.GELU())
+        self.msg = nn.ModuleList([nn.Linear(self.width, self.width*self.scale),  # for self
+                                  nn.Linear(self.width, self.width*self.scale),  # for neighbors
+                                  nn.GELU()])
         self.post = nn.Linear(self.width*self.scale, self.width)
 
     def forward(self, x, edge_index, edge_attr, edge_embed=None):
         edge_embed = self.embed(edge_attr, edge_embed)
         xx = self.pre(x)
-        xx = self.mem(xx) + self.propagate(edge_index, x=xx, edge_embed=edge_embed) * pt.exp(self.zero)
+        xx = self.msg[-1](self.msg[0](xx)) \
+           + self.propagate(edge_index, x=self.msg[1](xx), edge_embed=edge_embed)
         xx = self.post(xx)
-        return x + xx, xx, edge_embed
+        return x + xx * self.res, xx, edge_embed
 
     def message(self, x_i, x_j, edge_embed):
         if self.use_edge:
             x_i, x_j = x_i + edge_embed, x_j + edge_embed
         if self.use_atten:
             size = len(edge_embed)
-            atten = pt.sigmoid(pt.sum((x_i * x_j).reshape(size, -1, head_size), dim=-1, keepdim=True)) * 2
-            return (self.msg(x_j).reshape(*atten.shape[:-1], -1) * atten).reshape(size, -1)
+            atten = pt.exp(pt.sum((x_i * x_j).reshape(size, -1, head_size), dim=-1, keepdim=True) * self.zero)
+            return (self.msg[-1](x_j).reshape(*atten.shape[:-1], -1) * atten).reshape(size, -1)
         else:
-            return self.msg(x_j)
-
-    def update(self, aggr_out):
-        return aggr_out
+            return self.msg[-1](x_j) * pt.exp(self.zero)
 
 class DenseBlock(nn.Module):
-    def __init__(self, width, scale):
+    def __init__(self, width, scale, res=1.0):
         super().__init__()
         self.width = width
         self.scale = scale
+        self.res = res
 
         self.block = nn.Sequential(nn.Linear(self.width, self.width), nn.LayerNorm(self.width, elementwise_affine=False),
                                    nn.Linear(self.width, self.width*self.scale), nn.GELU(),
@@ -109,7 +116,7 @@ class DenseBlock(nn.Module):
 
     def forward(self, x):
         xx = self.block(x)
-        return x + xx, xx
+        return x + xx * self.res, xx
 
 
 class GNN(nn.Module):
@@ -122,17 +129,18 @@ class GNN(nn.Module):
         self.use_atten = use_atten
         self.use_global = use_global
         self.use_dense = use_dense
-        print('#model:', self.width, self.scale, self.depth, self.use_edge, self.use_atten, self.use_global, self.use_dense)
+        print('#model:', self.width, self.width*self.scale//head_size, self.depth, \
+                self.use_edge, self.use_atten, self.use_global, self.use_dense)
  
         self.embed = EmbedBlock(node_size, width)
 
         if use_global:
-            self.glob = nn.ModuleList([GlobBlock(self.width, self.scale) for i in range(self.depth)])
+            self.glob = nn.ModuleList([GlobBlock(self.width, self.scale, 1/self.depth) for i in range(self.depth)])
         else:
             self.glob = [None] * self.depth
-        self.conv = nn.ModuleList([ConvBlock(self.width, self.scale, use_edge, use_atten) for i in range(self.depth)])
+        self.conv = nn.ModuleList([ConvBlock(self.width, self.scale, 1/self.depth, use_edge, use_atten) for i in range(self.depth)])
         if use_dense:
-            self.dense = nn.ModuleList([DenseBlock(self.width, self.scale) for i in range(self.depth)])
+            self.dense = nn.ModuleList([DenseBlock(self.width, self.scale, 1/self.depth) for i in range(self.depth)])
         else:
             self.dense = [None] * self.depth
         self.post = nn.Sequential(nn.Linear(self.width, self.width), nn.LayerNorm(self.width, elementwise_affine=False))
@@ -141,18 +149,18 @@ class GNN(nn.Module):
         print('#params:', np.sum([np.prod(p.shape) for p in self.parameters()]))
 
     def forward(self, graph, mask=None):
-        xx = graph.x.long().clone(); xx[:, 1:] += 1
+        xx = graph['atom'].x.long().clone(); xx[:, 1:] += 1
         if mask is not None: xx[mask] = 0
-        ea = graph.edge_attr.long().clone(); ea += 1
+        ea = graph['bond'].edge_attr.long().clone(); ea += 1
 
         xx, ee, xlst = self.embed(xx), None, []
         for i, glob, conv, dense in zip(range(self.depth), self.glob, self.conv, self.dense):
-            if glob is not None: xx, xres = glob(xx, graph.batch)
-            xx, xres, ee = conv(xx, graph.edge_index, ea, ee)
+            if glob is not None: xx, xres = glob(xx, graph['atom'].batch)
+            xx, xres, ee = conv(xx, graph['bond'].edge_index, ea, ee)
             if dense is not None: xx, xres = dense(xx)
             if i >= self.depth//2: xlst.append(nn.functional.layer_norm(xres, [self.width])[:, :, None])
         # novel global node = pool(norm(linear(all nodes)))
-        xglob = gnn.global_add_pool(self.post(xx), graph.batch)
+        xglob = gnn.global_add_pool(self.post(xx), graph['atom'].batch)
 
         return self.head(xglob), pt.mean(pt.concat(xlst, dim=-1), dim=-1)
 
