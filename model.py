@@ -1,5 +1,3 @@
-#!/opt/miniconda3/bin/python -Bu
-
 import numpy as np
 import torch as pt
 import torch.nn as nn
@@ -48,54 +46,76 @@ class EmbedBlock(nn.Module):
 
 
 class HeteroBlock(gnn.MessagePassing):
-    def __init__(self, width, scale, use_global=True, use_frag=False, use_atten=False, res=1.0):
+    def __init__(self, width, scale, config, res=1.0):
         super().__init__(aggr="add", flow="source_to_target")
         self.width = width
         self.scale = scale
-        assert use_global or use_frag
-        self.use_global = use_global
-        self.use_frag = use_frag
-        self.use_atten = use_atten
+        self.use_frag = config['use_frag']
+        self.atom_global = config['atom_global']
+        self.frag_global = config['frag_global']
+        self.a2f_atten = config['a2f_atten']
+        self.f2a_atten = config['f2a_atten']
         self.res = res
 
         self.init0 = nn.parameter.Parameter(pt.zeros(6))
 
-        self.pre = nn.ModuleList([nn.Sequential(nn.Linear(self.width, self.width), nn.LayerNorm(self.width, elementwise_affine=False)) for _ in range(2)])
+        self.pre = nn.ModuleList([nn.Sequential(nn.Linear(self.width, self.width),
+                                                nn.LayerNorm(self.width, elementwise_affine=False)) for _ in range(2)])
         self.msg = nn.ModuleList([nn.Linear(self.width, self.width*self.scale) for _ in range(10)] + [nn.GELU()])
         self.post = nn.ModuleList([nn.Linear(self.width*self.scale, self.width) for _ in range(2)])
 
     def forward(self, x, edge_index, batch):
-        if self.use_global and self.use_frag:
+        if self.use_frag:
             xx, zz = self.pre[0](x[0]), self.pre[1](x[1])
-            xx, zz = self.msg[-1](self.msg[0](xx)) \
-                   + self.msg[-1](self.msg[1](gnn.global_add_pool(xx, batch[0])))[batch[0]] * pt.exp(self.init0[0]) \
-                   + self.propagate(pt.flip(edge_index, [0]), x=(zz, xx), size=(len(zz), len(xx)), msg_idx=2, init0_idx=1) \
-                   , self.msg[-1](self.msg[5](zz)) \
-                   + self.msg[-1](self.msg[6](gnn.global_add_pool(zz, batch[1])))[batch[1]] * pt.exp(self.init0[3]) \
-                   + self.propagate(edge_index, x=(xx, zz), size=(len(xx), len(zz)), msg_idx=7, init0_idx=4)
+            if self.atom_global and self.frag_global:
+                xx, zz = self.msg[-1](self.msg[0](xx)) \
+                       + self.msg[-1](self.msg[1](gnn.global_add_pool(xx, batch[0])))[batch[0]] * pt.exp(self.init0[0]) \
+                       + self.propagate(pt.flip(edge_index, [0]), x=(zz, xx), size=(len(zz), len(xx)), \
+                                        msg_idx=2, init0_idx=1, use_atten=self.f2a_atten) \
+                       , self.msg[-1](self.msg[5](zz)) \
+                       + self.msg[-1](self.msg[6](gnn.global_add_pool(zz, batch[1])))[batch[1]] * pt.exp(self.init0[3]) \
+                       + self.propagate(edge_index, x=(xx, zz), size=(len(xx), len(zz)), \
+                                        msg_idx=7, init0_idx=4, use_atten=self.a2f_atten)
+            elif self.atom_global:
+                xx, zz = self.msg[-1](self.msg[0](xx)) \
+                       + self.msg[-1](self.msg[1](gnn.global_add_pool(xx, batch[0])))[batch[0]] * pt.exp(self.init0[0]) \
+                       + self.propagate(pt.flip(edge_index, [0]), x=(zz, xx), size=(len(zz), len(xx)), \
+                                        msg_idx=2, init0_idx=1, use_atten=self.f2a_atten) \
+                       , self.msg[-1](self.msg[5](zz)) \
+                       + self.propagate(edge_index, x=(xx, zz), size=(len(xx), len(zz)), \
+                                        msg_idx=7, init0_idx=4, use_atten=self.a2f_atten)
+            elif self.frag_global:
+                xx, zz = self.msg[-1](self.msg[0](xx)) \
+                       + self.propagate(pt.flip(edge_index, [0]), x=(zz, xx), size=(len(zz), len(xx)), \
+                                        msg_idx=2, init0_idx=1, use_atten=self.f2a_atten) \
+                       , self.msg[-1](self.msg[5](zz)) \
+                       + self.msg[-1](self.msg[6](gnn.global_add_pool(zz, batch[1])))[batch[1]] * pt.exp(self.init0[3]) \
+                       + self.propagate(edge_index, x=(xx, zz), size=(len(xx), len(zz)), \
+                                        msg_idx=7, init0_idx=4, use_atten=self.a2f_atten)
+            else:
+                xx, zz = self.msg[-1](self.msg[0](xx)) \
+                       + self.propagate(pt.flip(edge_index, [0]), x=(zz, xx), size=(len(zz), len(xx)), \
+                                        msg_idx=2, init0_idx=1, use_atten=self.f2a_atten) \
+                       , self.msg[-1](self.msg[5](zz)) \
+                       + self.propagate(edge_index, x=(xx, zz), size=(len(xx), len(zz)), \
+                                        msg_idx=7, init0_idx=4, use_atten=self.a2f_atten)
             xx, zz = self.post[0](xx), self.post[1](zz)
             return x[0] + xx * self.res, x[1] + zz * self.res
-        elif self.use_global:
+        else:
             xx = self.pre[0](x[0])
-            xx = self.msg[-1](self.msg[0](xx)) \
-               + self.msg[-1](self.msg[1](gnn.global_add_pool(xx, batch[0])))[batch[0]] * pt.exp(self.init0[0])
+            if self.atom_global:
+                xx = self.msg[-1](self.msg[0](xx)) \
+                   + self.msg[-1](self.msg[1](gnn.global_add_pool(xx, batch[0])))[batch[0]] * pt.exp(self.init0[0])
+            else: raise Exception('Not implemented model configuration!')
             xx = self.post[0](xx)
             return x[0] + xx * self.res, x[1]
-        elif self.use_frag:
-            xx, zz = self.pre[0](x[0]), self.pre[1](x[1])
-            xx, zz = self.msg[-1](self.msg[0](xx)) \
-                   + self.propagate(pt.flip(edge_index, [0]), x=(zz, xx), size=(len(zz), len(xx)), msg_idx=1, init0_idx=0) \
-                   , self.msg[-1](self.msg[4](zz)) \
-                   + self.propagate(edge_index, x=(xx, zz), size=(len(xx), len(zz)), msg_idx=5, init0_idx=2)
-            xx, zz = self.post[0](xx), self.post[1](zz)
-            return x[0] + xx * self.res, x[1] + zz * self.res
 
-    def message(self, x_i, x_j, msg_idx, init0_idx):
+    def message(self, x_i, x_j, msg_idx, init0_idx, use_atten):
         x_q = self.msg[msg_idx+0](x_i)
         x_k = self.msg[msg_idx+1](x_j)
         x_v = self.msg[msg_idx+2](x_j)
         x_v = self.msg[-1](x_v)
-        if self.use_atten:
+        if use_atten:
             # normalized dot product
             att = pt.sum((x_q * x_k).reshape(x_v.shape[0], -1, head_dim), dim=-1, keepdim=True) / np.sqrt(head_dim)
             # unnormalized softmax with scaling and bias
@@ -105,13 +125,13 @@ class HeteroBlock(gnn.MessagePassing):
             return x_v * pt.exp(self.init0[init0_idx])
 
 class ConvBlock(gnn.MessagePassing):
-    def __init__(self, width, scale, edge_size, hop=1, use_edge=False, use_atten=False, res=1.0):
+    def __init__(self, width, scale, edge_size, config, prefix, res=1.0):
         super().__init__(aggr="add", flow="source_to_target")
         self.width = width
         self.scale = scale
-        self.hop = hop
-        self.use_edge = use_edge
-        self.use_atten = use_atten
+        self.hop = config[prefix + 'hop']
+        self.use_edge = config[prefix + 'edge']
+        self.use_atten = config[prefix + 'atten']
         self.res = res
 
         self.embed = nn.ModuleList([EmbedBlock(edge_size*i, self.width//2) for i in range(1, self.hop+1)])
@@ -140,7 +160,7 @@ class ConvBlock(gnn.MessagePassing):
                + self.propagate(edge_index[2], x=xx, edge_embed=self.embed[2](edge_attr[2], edge_embed[2]), edge_type=2)
         else: raise Exception('Unknown hop number:', self.hop)
         xx = self.post(xx)
-        return x + xx * self.res, xx, edge_embed
+        return x + xx * self.res, edge_embed
 
     def message(self, x_i, x_j, edge_embed, edge_type):
         idx = edge_type * 3
@@ -179,36 +199,24 @@ class DenseBlock(nn.Module):
 
 
 class GNN(nn.Module):
-    def __init__(self, width, scale, depth, hop=1, use_edge=False, use_atten=False, use_global=False, use_frag=False, use_dense=False):
+    def __init__(self, width, scale, depth, config):
         super().__init__()
         self.width = width
         self.scale = scale
         self.depth = depth
-        self.hop = hop
-        self.use_edge = use_edge
-        self.use_atten = use_atten
-        self.use_global = use_global
-        self.use_frag = use_frag
-        self.use_dense = use_dense
-        print('#model:', width, width*scale//head_dim, depth, hop, use_edge, use_atten, use_global, use_frag, use_dense)
+        self.config = config
+        assert 1 <= config['atom_hop'] <= 3
+        assert 0 <= config['frag_hop'] <= 1
+        print('#model:', width, width*scale//head_dim, depth)
  
         self.embed = nn.ModuleList([EmbedBlock(atom_size, width), nn.Embedding(1, self.width)])
 
         res = 1 / depth
-        if use_global or use_frag:
-            self.hetero = nn.ModuleList([HeteroBlock(width, scale, use_global, use_frag, use_atten, res=res) for i in range(depth)])
-            self.conv1 = nn.ModuleList([ConvBlock(width, scale, pseudo_size, 1, use_edge, use_atten, res=res) for i in range(depth)])
-            if use_dense:
-                self.dense1 = nn.ModuleList([DenseBlock(width, scale, res=res) for i in range(depth)])
-            else:
-                self.dense1 = [None] * depth
-        else:
-            self.hetero = self.conv1 = self.dense1 = [None] * depth
-        self.conv0 = nn.ModuleList([ConvBlock(width, scale, bond_size, hop, use_edge, use_atten, res=res) for i in range(depth)])
-        if use_dense:
-            self.dense0 = nn.ModuleList([DenseBlock(width, scale, res=res) for i in range(depth)])
-        else:
-            self.dense0 = [None] * depth
+        self.hetero = nn.ModuleList([HeteroBlock(width, scale, config, res=res) for i in range(depth)])
+        self.conv_atom = nn.ModuleList([ConvBlock(width, scale, bond_size, config, prefix='atom_', res=res) for i in range(depth)])
+        self.conv_frag = nn.ModuleList([ConvBlock(width, scale, pseudo_size, config, prefix='frag_', res=res) for i in range(depth)])
+        self.dense_atom = nn.ModuleList([DenseBlock(width, scale, res=res) for i in range(depth)])
+        self.dense_frag = nn.ModuleList([DenseBlock(width, scale, res=res) for i in range(depth)])
         self.post = nn.Sequential(nn.Linear(width, width), nn.LayerNorm(width, elementwise_affine=False))
 
         self.head = nn.Linear(width, 1)
@@ -220,32 +228,39 @@ class GNN(nn.Module):
         xx, xlst = self.embed[0](xx), []
         zz = self.embed[1](graph['frag'].x.long().reshape(-1))
         xei = []; xea = []; xee = []
-        if self.hop > 0:
+        if self.config['atom_hop'] > 0:
             xei.append(graph['bond'].edge_index.long())
             xea.append(graph['bond'].edge_attr.long().clone()); xea[-1] += 1
             xee.append(None)
-        if self.hop > 1:
+        if self.config['atom_hop'] > 1:
             xei.append(graph['2hop'].edge_index.long())
             xea.append(graph['2hop'].edge_attr.long().clone()); xea[-1] += 1
             xee.append(None)
-        if self.hop > 2:
+        if self.config['atom_hop'] > 2:
             xei.append(graph['3hop'].edge_index.long())
             xea.append(graph['3hop'].edge_attr.long().clone()); xea[-1] += 1
             xee.append(None)
-        zei = [graph['pseudo'].edge_index.long()]
-        zea = [graph['pseudo'].edge_attr.long().clone()]; zea[-1] += 1
-        zee = [None]
+        if self.config['frag_hop'] == 1:
+            zei = [graph['pseudo'].edge_index.long()]
+            zea = [graph['pseudo'].edge_attr.long().clone()]; zea[-1] += 1
+            zee = [None]
         xzei = graph['part'].edge_index.long()
 
-        for i, hetero, conv0, conv1, dense0, dense1 in zip(range(self.depth), self.hetero, self.conv0, self.conv1, self.dense0, self.dense1):
-            if hetero is not None: xx, zz = hetero((xx, zz), xzei, (graph['atom'].batch, graph['frag'].batch))
-            xx, xres, xee = conv0(xx, xei, xea, xee)
-            if conv1 is not None: zz, _, zee = conv1(zz, zei, zea, zee)
-            if dense0 is not None: xx, xres = dense0(xx)
-            if dense1 is not None: zz, _ = dense1(zz)
-            if i >= self.depth//2: xlst.append(nn.functional.layer_norm(xres, [self.width])[:, :, None])
+        for i, hetero, conv_atom, conv_frag, dense_atom, dense_frag in \
+                zip(range(self.depth), self.hetero, self.conv_atom, self.conv_frag, self.dense_atom, self.dense_frag):
+            if self.config['atom_global'] or self.config['use_frag']:
+                xx, zz = hetero((xx, zz), xzei, (graph['atom'].batch, graph['frag'].batch))
+            xx, xee = conv_atom(xx, xei, xea, xee)
+            if self.config['atom_dense']:
+                xx, xres = dense_atom(xx)
+            if self.config['use_frag']:
+                if self.config['frag_hop'] > 0:
+                    zz, zee = conv_frag(zz, zei, zea, zee)
+                if self.config['atom_dense']:
+                    zz, _ = dense_frag(zz)
+            #if i >= self.depth//2: xlst.append(nn.functional.layer_norm(xres, [self.width])[:, :, None])
         # novel global node = pool(norm(linear(all nodes)))
         xglob = gnn.global_add_pool(self.post(xx), graph['atom'].batch)
 
-        return self.head(xglob), pt.mean(pt.concat(xlst, dim=-1), dim=-1)
+        return self.head(xglob), None  #pt.mean(pt.concat(xlst, dim=-1), dim=-1)
 

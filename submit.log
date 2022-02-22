@@ -1,7 +1,8 @@
-#model: 256 12 4 True True True True
-#params: 7261465
+#device: 3 1.10.2 11.3 True True
+#model: 256 12 4
+#params: 28246185
 
-#valid: 0.1058
-#testdev: [5.7208323 5.7296743 5.6734276 ... 5.6172104 8.226109  4.543094 ] (147037,)
-82.19user 14.12system 1:38.40elapsed 97%CPU (0avgtext+0avgdata 17234704maxresident)k
-0inputs+1064outputs (0major+5047862minor)pagefaults 0swaps
+#valid: 0.0994
+#testdev: [5.7438936 5.7423763 5.640139  ... 5.644581  8.16764   4.526989 ] (147037,) 90.5s
+143.44user 12.56system 2:30.18elapsed 103%CPU (0avgtext+0avgdata 15565476maxresident)k
+0inputs+1040outputs (1major+5628748minor)pagefaults 0swaps
